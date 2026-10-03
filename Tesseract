@@ -1,0 +1,135 @@
+const float PIXEL_SIZE     = 1.0;    // 1 = smooth, 3-6 = chunky pixel art
+const float POSTERIZE      = 0.0;    // colour levels per channel (0 = off, try 4-6)
+const float DITHER         = 1.0;    
+const float EXPOSURE       = 1.4;
+
+const float HYPER_SPEED    = 0.35;   // speed of rotation through the 4th dimension
+const float PROJECTION_4D  = 3.2;    // 4D camera distance (> 2.2). Lower = more warped inner cube
+const float SIZE           = 0.55;   
+const float EDGE_RADIUS    = 0.03;   
+const float VERTEX_RADIUS  = 0.075;  
+const float GLOW           = 1.0;    
+
+const float ORBIT_SPEED    = 0.10;   
+const float CAMERA_DIST    = 6.0;
+const float CAMERA_PITCH   = 0.35;   // radians
+
+#define HEX(h) (vec3(float(((h) >> 16) & 255), float(((h) >> 8) & 255), float((h) & 255)) / 255.0)
+#define COL_NEAR    HEX(0x7df9ff)   // parts nearest in the 4th dimension
+#define COL_FAR     HEX(0xff4fd8)   // parts furthest in the 4th dimension
+#define COL_BG_TOP  HEX(0x140a33)
+#define COL_BG_BOT  HEX(0x02010a)
+
+
+vec3  V[16];   // projected vertices
+float VW[16];  // their 4th-dimension depth, -1..1
+
+float hash31(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+float bayer2(vec2 a) { a = floor(a); return fract(dot(a, vec2(0.5, a.y * 0.75))); }
+float bayer4(vec2 a) { return bayer2(0.5 * a) * 0.25 + bayer2(a); }
+vec2 rot2(vec2 v, float a) { float c = cos(a), s = sin(a); return vec2(c*v.x - s*v.y, s*v.x + c*v.y); }
+
+vec3 finish(vec3 col, vec2 cell) {
+    col = 1.0 - exp(-col * EXPOSURE);
+    if (POSTERIZE > 1.0) {
+        float off = mix(0.5, bayer4(cell), DITHER);
+        col = floor(col * (POSTERIZE - 1.0) + off) / (POSTERIZE - 1.0);
+    }
+    return clamp(col, 0.0, 1.0);
+}
+
+void buildTesseract(float t) {
+    for (int i = 0; i < 16; i++) {
+        vec4 p = vec4((i & 1) == 0 ? -1.0 : 1.0, (i & 2) == 0 ? -1.0 : 1.0,
+                      (i & 4) == 0 ? -1.0 : 1.0, (i & 8) == 0 ? -1.0 : 1.0);
+        p.xw = rot2(p.xw, t * 1.00);
+        p.yw = rot2(p.yw, t * 0.70);
+        p.zw = rot2(p.zw, t * 0.45);
+        p.xy = rot2(p.xy, t * 0.20);
+        float k = PROJECTION_4D / max(PROJECTION_4D - p.w, 0.2);
+        V[i]  = p.xyz * k * SIZE;
+        VW[i] = clamp(p.w * 0.5, -1.0, 1.0);
+    }
+}
+
+vec2 map(vec3 p) {
+    float d = 1e9, w = 0.0;
+    for (int i = 0; i < 16; i++) {
+        float ds = length(p - V[i]) - VERTEX_RADIUS;
+        if (ds < d) { d = ds; w = VW[i]; }
+        for (int b = 0; b < 4; b++) {
+            int j = i ^ (1 << b);
+            if (j <= i) 
+                continue;
+            vec3 pa = p - V[i], ba = V[j] - V[i];
+            float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+            float dc = length(pa - ba * h) - EDGE_RADIUS;
+            if (dc < d) { d = dc; w = mix(VW[i], VW[j], h); }
+        }
+    }
+    return vec2(d, w);
+}
+
+vec3 calcNormal(vec3 p) {
+    const vec2 e = vec2(0.001, -0.001);
+    return normalize(e.xyy * map(p + e.xyy).x + e.yyx * map(p + e.yyx).x +
+                     e.yxy * map(p + e.yxy).x + e.xxx * map(p + e.xxx).x);
+}
+
+vec3 background(vec3 rd) {
+    vec3 col = mix(COL_BG_BOT, COL_BG_TOP, rd.y * 0.5 + 0.5);
+    vec3 q = floor(rd * 250.0);
+    if (hash31(q) > 0.998) col += vec3(0.6 + 0.4 * hash31(q + 1.0));
+    return col;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 cell = floor(fragCoord / PIXEL_SIZE);
+    vec2 fc   = (cell + 0.5) * PIXEL_SIZE;
+    vec2 uv   = (fc - 0.5 * iResolution.xy) / iResolution.y;
+
+    buildTesseract(iTime * HYPER_SPEED);
+
+    float yaw   = iTime * ORBIT_SPEED + iMouse.x / iResolution.x * 6.2832;
+    float pitch = iMouse.y > 0.0 ? (iMouse.y / iResolution.y - 0.5) * 2.8 : CAMERA_PITCH;
+    vec3 ro = CAMERA_DIST * vec3(cos(pitch) * sin(yaw), sin(pitch), cos(pitch) * cos(yaw));
+    vec3 fw = normalize(-ro);
+    vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));
+    vec3 up = cross(rt, fw);
+    vec3 rd = normalize(uv.x * rt + uv.y * up + 1.8 * fw);
+
+    float t = 0.0, glow = 0.0, glowW = 0.0;
+    vec2 h = vec2(1e9, 0.0);
+    bool hit = false;
+    for (int i = 0; i < 100; i++) {
+        h = map(ro + rd * t);
+        float g = 0.012 / (0.012 + h.x * h.x * 60.0);
+        glow += g;
+        glowW += g * h.y;
+        if 
+            (h.x < 0.001) 
+            { hit = true; break; }
+        t += h.x;
+        if 
+            (t > 20.0) break;
+    }
+
+    vec3 col = background(rd);
+    if (hit) {
+        vec3 p = ro + rd * t;
+        vec3 n = calcNormal(p);
+        vec3 base = mix(COL_FAR, COL_NEAR, h.y * 0.5 + 0.5);
+        vec3 L = normalize(vec3(0.6, 0.8, 0.4));
+        float dif = max(dot(n, L), 0.0);
+        float fre = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+        col = base * (0.25 + 0.9 * dif) + base * fre * 0.8 + fre * 0.15;
+    }
+    float gw = glow > 0.0 ? glowW / glow : 0.0;
+    col += mix(COL_FAR, COL_NEAR, gw * 0.5 + 0.5) * glow * 0.06 * GLOW;
+
+    fragColor = vec4(finish(col, cell), 1.0);
+}
